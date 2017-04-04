@@ -41,6 +41,7 @@
 #include "netboot.h"
 #include "shim_cert.h"
 #include "replacements.h"
+#include "tpm.h"
 #include "ucs2.h"
 
 #include "guid.h"
@@ -61,6 +62,27 @@ static CHAR16 *second_stage;
 static void *load_options;
 static UINT32 load_options_size;
 static UINT8 in_protocol;
+
+static unsigned char TPM_itoa64[16] =
+        "0123456789ABCDEF";
+
+void itochar(UINT8* input, CHAR16* output){
+	int i =20;
+	UINT8 tmp =0;
+	UINT8 a,b;
+	UINT8 c =0;
+	for(i=0;i<20;i++){
+		tmp=input[i];
+		a=tmp>>4;
+		a = a & 0xf;
+		output[c++]=TPM_itoa64[a];
+		b= tmp & 0xf;
+		output[c++]=TPM_itoa64[b];
+	}
+
+}
+
+
 
 #define perror(fmt, ...) ({						\
 		UINTN __perror_ret = 0;					\
@@ -107,6 +129,7 @@ typedef struct {
 	UINT32 MokSize;
 	UINT8 *Mok;
 } MokListNode;
+
 
 /*
  * Perform basic bounds checking of the intra-image pointers
@@ -484,7 +507,6 @@ static CHECK_STATUS check_db_hash_in_ram(EFI_SIGNATURE_LIST *CertList,
 
 	return DATA_NOT_FOUND;
 }
-
 /*
  * Check a hash against an EFI_SIGNATURE_LIST in a UEFI variable
  */
@@ -510,6 +532,7 @@ static CHECK_STATUS check_db_hash(CHAR16 *dbname, EFI_GUID guid, UINT8 *data,
 	return rc;
 
 }
+
 
 /*
  * Check whether the binary signature or hash are present in dbx or the
@@ -561,16 +584,23 @@ static void update_verification_method(verification_method_t method)
 		verification_method = method;
 }
 
-/*
- * Check whether the binary signature or hash are present in db or MokList
- */
-static EFI_STATUS check_whitelist (WIN_CERTIFICATE_EFI_PKCS *cert,
-				   UINT8 *sha256hash, UINT8 *sha1hash)
+/*To use PCR verification*/
+static EFI_STATUS check_whitelist_pcr (WIN_CERTIFICATE_EFI_PKCS *cert,
+				   UINT8 *sha256hash, UINT8 *sha1hash, UINT8 *pcrval)
 {
 	EFI_GUID secure_var = EFI_IMAGE_SECURITY_DATABASE_GUID;
 	EFI_GUID shim_var = SHIM_LOCK_GUID;
 
 	if (!ignore_db) {
+		if (check_db_hash(L"db", secure_var, pcrval, SHA256_DIGEST_SIZE,
+					EFI_CERT_SHA256_GUID) == DATA_FOUND) {
+			update_verification_method(VERIFIED_BY_HASH);
+			return EFI_SUCCESS;
+		}
+		/*else {update_verification_method(VERIFIED_BY_HASH);
+		       	return EFI_SUCCESS;
+		}*/
+	
 		if (check_db_hash(L"db", secure_var, sha256hash, SHA256_DIGEST_SIZE,
 					EFI_CERT_SHA256_GUID) == DATA_FOUND) {
 			update_verification_method(VERIFIED_BY_HASH);
@@ -606,6 +636,54 @@ static EFI_STATUS check_whitelist (WIN_CERTIFICATE_EFI_PKCS *cert,
 	update_verification_method(VERIFIED_BY_NOTHING);
 	return EFI_ACCESS_DENIED;
 }
+
+/*
+ * Check whether the binary signature or hash are present in db or MokList
+ */
+static EFI_STATUS check_whitelist (WIN_CERTIFICATE_EFI_PKCS *cert,
+				   UINT8 *sha256hash, UINT8 *sha1hash)
+{
+	EFI_GUID secure_var = EFI_IMAGE_SECURITY_DATABASE_GUID;
+	EFI_GUID shim_var = SHIM_LOCK_GUID;
+
+	if (!ignore_db) {
+	
+		if (check_db_hash(L"db", secure_var, sha256hash, SHA256_DIGEST_SIZE,
+					EFI_CERT_SHA256_GUID) == DATA_FOUND) {
+			update_verification_method(VERIFIED_BY_HASH);
+			return EFI_SUCCESS;
+		}
+		if (check_db_hash(L"db", secure_var, sha1hash, SHA1_DIGEST_SIZE,
+					EFI_CERT_SHA1_GUID) == DATA_FOUND) {
+			verification_method = VERIFIED_BY_HASH;
+			update_verification_method(VERIFIED_BY_HASH);
+			return EFI_SUCCESS;
+		}
+		if (cert && check_db_cert(L"db", secure_var, cert, sha256hash)
+					== DATA_FOUND) {
+			verification_method = VERIFIED_BY_CERT;
+			update_verification_method(VERIFIED_BY_CERT);
+			return EFI_SUCCESS;
+		}
+	}
+
+	if (check_db_hash(L"MokList", shim_var, sha256hash, SHA256_DIGEST_SIZE,
+			  EFI_CERT_SHA256_GUID) == DATA_FOUND) {
+		verification_method = VERIFIED_BY_HASH;
+		update_verification_method(VERIFIED_BY_HASH);
+		return EFI_SUCCESS;
+	}
+	if (cert && check_db_cert(L"MokList", shim_var, cert, sha256hash) ==
+				DATA_FOUND) {
+		verification_method = VERIFIED_BY_CERT;
+		update_verification_method(VERIFIED_BY_CERT);
+		return EFI_SUCCESS;
+	}
+
+	update_verification_method(VERIFIED_BY_NOTHING);
+	return EFI_ACCESS_DENIED;
+}
+
 
 /*
  * Check whether we're in Secure Boot and user mode
@@ -899,6 +977,114 @@ static EFI_STATUS verify_mok (void) {
 
 	return EFI_SUCCESS;
 }
+/*To use PCR verification*/
+/*
+ * Check that the signature is valid and matches the binary
+ */
+static EFI_STATUS pcr_verify_buffer (char *data, int datasize,
+			 PE_COFF_LOADER_IMAGE_CONTEXT *context)
+{
+	UINT8 sha256hash[SHA256_DIGEST_SIZE];
+	UINT8 sha1hash[SHA1_DIGEST_SIZE];
+	EFI_STATUS status = EFI_ACCESS_DENIED;
+	WIN_CERTIFICATE_EFI_PKCS *cert = NULL;
+	unsigned int size = datasize;
+
+	if (context->SecDir->Size != 0) {
+		cert = ImageAddress (data, size,
+				     context->SecDir->VirtualAddress);
+
+		if (!cert) {
+			perror(L"Certificate located outside the image\n");
+			return EFI_INVALID_PARAMETER;
+		}
+
+		if (cert->Hdr.wCertificateType !=
+		    WIN_CERT_TYPE_PKCS_SIGNED_DATA) {
+			perror(L"Unsupported certificate type %x\n",
+				cert->Hdr.wCertificateType);
+			return EFI_UNSUPPORTED;
+		}
+	}
+
+	status = generate_hash(data, datasize, context, sha256hash, sha1hash);
+	if (status != EFI_SUCCESS)
+		return status;
+
+	/* Measure the grub binary into the TPM */
+	UINTN strsize 	= sizeof("Second stage bootloader-grub");
+	status = tpm_log_event(sha1hash, strsize, 9, (const CHAR8 *)"Second stage bootloader");
+	if (status != EFI_SUCCESS) {
+		perror(L"TPM_LOG_EVENT:shim second stage bootloader\n");
+		return status;
+	}
+
+	/*
+	 * Check that the MOK database hasn't been modified
+	 */
+	status = verify_mok();
+	if (status != EFI_SUCCESS)
+		return status;
+
+	/*
+	 * Ensure that the binary isn't blacklisted
+	 */
+	status = check_blacklist(cert, sha256hash, sha1hash);
+
+	if (status != EFI_SUCCESS) {
+		perror(L"Binary is blacklisted\n");
+		return status;
+	}
+
+	console_notify(L"Hello from READPCR");
+	UINT8 pcrval[20]={0,};
+	TPM_readpcr(4, pcrval);
+		
+	CHAR16 pcr_msg[40]={0,};
+	itochar(pcrval,pcr_msg);	
+
+	console_notify(pcr_msg);
+
+
+
+//TODO 
+	/*
+	 * Check whether the binary is whitelisted in any of the firmware
+	 * databases
+	 */
+	status = check_whitelist_pcr(cert, sha256hash, sha1hash, pcrval);
+	if (status == EFI_SUCCESS)
+		return status;
+
+	if (cert) {
+		/*
+		 * Check against the shim build key
+		 */
+		if (sizeof(shim_cert) &&
+		    AuthenticodeVerify(cert->CertData,
+			       context->SecDir->Size - sizeof(cert->Hdr),
+			       shim_cert, sizeof(shim_cert), sha256hash,
+			       SHA256_DIGEST_SIZE)) {
+			status = EFI_SUCCESS;
+			return status;
+		}
+
+		/*
+		 * And finally, check against shim's built-in key
+		 */
+		if (vendor_cert_size && AuthenticodeVerify(cert->CertData,
+							context->SecDir->Size - sizeof(cert->Hdr),
+							vendor_cert, vendor_cert_size, sha256hash,
+							SHA256_DIGEST_SIZE)) {
+			status = EFI_SUCCESS;
+			return status;
+		}
+	}
+
+	status = EFI_ACCESS_DENIED;
+
+	return status;
+}
 
 /*
  * Check that the signature is valid and matches the binary
@@ -930,9 +1116,16 @@ static EFI_STATUS verify_buffer (char *data, int datasize,
 	}
 
 	status = generate_hash(data, datasize, context, sha256hash, sha1hash);
-
 	if (status != EFI_SUCCESS)
 		return status;
+
+	/* Measure the grub binary into the TPM */
+	UINTN strsize 	= sizeof("Second stage bootloader-grub");
+	status = tpm_log_event(sha1hash, strsize, 8, (const CHAR8 *)"Second stage bootloader");
+	if (status != EFI_SUCCESS) {
+		perror(L"TPM_LOG_EVENT:shim second stage bootloader\n");
+		return status;
+	}
 
 	/*
 	 * Check that the MOK database hasn't been modified
@@ -950,6 +1143,7 @@ static EFI_STATUS verify_buffer (char *data, int datasize,
 		perror(L"Binary is blacklisted\n");
 		return status;
 	}
+
 
 	/*
 	 * Check whether the binary is whitelisted in any of the firmware
@@ -988,7 +1182,6 @@ static EFI_STATUS verify_buffer (char *data, int datasize,
 
 	return status;
 }
-
 /*
  * Read the binary header and grab appropriate information from it
  */
@@ -1136,6 +1329,8 @@ static EFI_STATUS handle_image (void *data, unsigned int datasize,
 	 */
 	if (secure_mode ()) {
 		efi_status = verify_buffer(data, datasize, &context);
+		efi_status = pcr_verify_buffer(data, datasize, &context);
+
 
 		if (EFI_ERROR(efi_status)) {
 			console_error(L"Verification failed", efi_status);
@@ -1270,8 +1465,8 @@ should_use_fallback(EFI_HANDLE image_handle)
 	unsigned int pathlen = 0;
 	CHAR16 *bootpath = NULL;
 	EFI_FILE_IO_INTERFACE *fio = NULL;
-	EFI_FILE *vh;
-	EFI_FILE *fh;
+	EFI_FILE *vh = NULL;
+	EFI_FILE *fh = NULL;
 	EFI_STATUS rc;
 	int ret = 0;
 
@@ -1290,7 +1485,9 @@ should_use_fallback(EFI_HANDLE image_handle)
 	 * L"\\EFI\\BOOT\\/BOOTX64.EFI".  So just handle that here...
 	 */
 	if (StrnCaseCmp(bootpath, L"\\EFI\\BOOT\\BOOT", 14) &&
-			StrnCaseCmp(bootpath, L"\\EFI\\BOOT\\/BOOT", 15))
+			StrnCaseCmp(bootpath, L"\\EFI\\BOOT\\/BOOT", 15) &&
+			StrnCaseCmp(bootpath, L"EFI\\BOOT\\BOOT", 13) &&
+			StrnCaseCmp(bootpath, L"EFI\\BOOT\\/BOOT", 14))
 		goto error;
 
 	pathlen = StrLen(bootpath);
@@ -1322,11 +1519,13 @@ should_use_fallback(EFI_HANDLE image_handle)
 		uefi_call_wrapper(vh->Close, 1, vh);
 		goto error;
 	}
-	uefi_call_wrapper(fh->Close, 1, fh);
-	uefi_call_wrapper(vh->Close, 1, vh);
 
 	ret = 1;
 error:
+	if (fh)
+		uefi_call_wrapper(fh->Close, 1, fh);
+	if (vh)
+	    uefi_call_wrapper(vh->Close, 1, vh);
 	if (bootpath)
 		FreePool(bootpath);
 
@@ -1346,6 +1545,24 @@ static EFI_STATUS generate_path(EFI_LOADED_IMAGE *li, CHAR16 *ImagePath,
 	unsigned int pathlen = 0;
 	EFI_STATUS efi_status = EFI_SUCCESS;
 	CHAR16 *bootpath;
+
+	/*
+	 * Suuuuper lazy technique here, but check and see if this is a full
+	 * path to something on the ESP.  Backwards compatibility demands
+	 * that we don't just use \\, becuase we (not particularly brightly)
+	 * used to require that the relative file path started with that.
+	 *
+	 * If it is a full path, don't try to merge it with the directory
+	 * from our Loaded Image handle.
+	 */
+	if (StrSize(ImagePath) > 5 && StrnCmp(ImagePath, L"\\EFI\\", 5) == 0) {
+		*PathName = StrDuplicate(ImagePath);
+		if (!*PathName) {
+			perror(L"Failed to allocate path buffer\n");
+			return EFI_OUT_OF_RESOURCES;
+		}
+		return EFI_SUCCESS;
+	}
 
 	devpath = li->FilePath;
 
@@ -1533,7 +1750,7 @@ error:
  * Protocol entry point. If secure boot is enabled, verify that the provided
  * buffer is signed with a trusted key.
  */
-EFI_STATUS shim_verify (void *buffer, UINT32 size)
+EFI_STATUS shim_verify (void *buffer, UINT32 size, UINT8 *pcrval)
 {
 	EFI_STATUS status = EFI_SUCCESS;
 	PE_COFF_LOADER_IMAGE_CONTEXT context;
@@ -1549,6 +1766,7 @@ EFI_STATUS shim_verify (void *buffer, UINT32 size)
 		goto done;
 
 	status = verify_buffer(buffer, size, &context);
+	status = pcr_verify_buffer(buffer, size, &context);
 done:
 	in_protocol = 0;
 	return status;
@@ -1562,6 +1780,16 @@ static EFI_STATUS shim_hash (char *data, int datasize,
 
 	in_protocol = 1;
 	status = generate_hash(data, datasize, context, sha256hash, sha1hash);
+
+	/* Measure the shim binary into the TPM */
+/*
+	console_notify(L"shim_hash");
+	UINTN strsize 	= sizeof("First stage bootloader-shim");
+	status = tpm_log_event(sha1hash, strsize, 8, (const CHAR8*)"First stage bootloader-shim");
+	console_notify(L"tpm_log_event_First stage bootloader");
+	if (status != EFI_SUCCESS)
+		return status;
+*/
 	in_protocol = 0;
 
 	return status;
@@ -1706,6 +1934,53 @@ EFI_STATUS init_grub(EFI_HANDLE image_handle)
 		Print(L"start_image() returned %r\n", efi_status);
 		uefi_call_wrapper(BS->Stall, 1, 2000000);
 	}
+
+	return efi_status;
+}
+
+/*
+ * Measure some of the MOK variables into the TPM
+ */
+EFI_STATUS measure_mok()
+{
+	EFI_GUID shim_lock_guid = SHIM_LOCK_GUID;
+	EFI_STATUS efi_status;
+	UINT8 *Data = NULL;
+	UINTN DataSize = 0;
+	UINT8 sha1hash[SHA1_DIGEST_SIZE];
+
+	efi_status = get_variable(L"MokList", &Data, &DataSize, shim_lock_guid);
+	if (efi_status != EFI_SUCCESS)
+		return efi_status;
+
+	//TO-DO: put sha1 hash on sha1hash from Data
+	CopyMem(sha1hash, Data, sizeof(sha1hash));
+	/* Measure the MOK LIST into the TPM */
+	UINTN strsize 	= sizeof("MokList");
+	efi_status = tpm_log_event(sha1hash, strsize, 14, (const CHAR8 *)"MokList");
+	//efi_status = tpm_log_event((EFI_PHYSICAL_ADDRESS)Data, DataSize, 14,
+	//			   (CHAR8 *)"MokList");
+
+	FreePool(Data);
+
+	if (efi_status != EFI_SUCCESS)
+		return efi_status;
+
+	efi_status = get_variable(L"MokSBState", &Data, &DataSize,
+				  shim_lock_guid);
+
+	if (efi_status != EFI_SUCCESS)
+		return efi_status;
+
+	//TO-DO: put sha1 hash on sha1hash from Data
+	CopyMem(sha1hash, Data, sizeof(sha1hash));
+	/* Measure the MOK LIST into the TPM */
+	strsize 	= sizeof("MokSBState");
+	efi_status = tpm_log_event(sha1hash, strsize, 14, (const CHAR8 *)"MokSBState");
+	//efi_status = tpm_log_event((EFI_PHYSICAL_ADDRESS)Data, DataSize, 14,
+	//			   (CHAR8 *)"MokSBState");
+
+	FreePool(Data);
 
 	return efi_status;
 }
@@ -1951,6 +2226,118 @@ static EFI_STATUS mok_ignore_db()
 
 }
 
+EFI_GUID bds_guid = { 0x8108ac4e, 0x9f11, 0x4d59, { 0x85, 0x0e, 0xe2, 0x1a, 0x52, 0x2c, 0x59, 0xb2 } };
+
+static inline EFI_STATUS
+get_load_option_optional_data(UINT8 *data, UINTN data_size,
+			      UINT8 **od, UINTN *ods)
+{
+	/*
+	 * If it's not at least Attributes + FilePathListLength +
+	 * Description=L"" + 0x7fff0400 (EndEntrireDevicePath), it can't
+	 * be valid.
+	 */
+	if (data_size < (sizeof(UINT32) + sizeof(UINT16) + 2 + 4))
+		return EFI_INVALID_PARAMETER;
+
+	UINT8 *cur = data + sizeof(UINT32);
+	UINT16 fplistlen = *(UINT16 *)cur;
+	/*
+	 * If there's not enough space for the file path list and the
+	 * smallest possible description (L""), it's not valid.
+	 */
+	if (fplistlen > data_size - (sizeof(UINT32) + 2 + 4))
+		return EFI_INVALID_PARAMETER;
+
+	cur += sizeof(UINT16);
+	UINTN limit = data_size - (cur - data) - fplistlen;
+	UINTN i;
+	for (i = 0; i < limit ; i++) {
+		/* If the description isn't valid UCS2-LE, it's not valid. */
+		if (i % 2 != 0) {
+			if (cur[i] != 0)
+				return EFI_INVALID_PARAMETER;
+		} else if (cur[i] == 0) {
+			/* we've found the end */
+			i++;
+			if (i >= limit || cur[i] != 0)
+				return EFI_INVALID_PARAMETER;
+			break;
+		}
+	}
+	i++;
+	if (i > limit)
+		return EFI_INVALID_PARAMETER;
+
+	/*
+	 * If i is limit, we know the rest of this is the FilePathList and
+	 * there's no optional data.  So just bail now.
+	 */
+	if (i == limit) {
+		*od = NULL;
+		*ods = 0;
+		return EFI_SUCCESS;
+	}
+
+	cur += i;
+	limit -= i;
+	limit += fplistlen;
+	i = 0;
+	while (limit - i >= 4) {
+		struct {
+			UINT8 type;
+			UINT8 subtype;
+			UINT16 len;
+		} dp = {
+			.type = cur[i],
+			.subtype = cur[i+1],
+			/*
+			 * it's a little endian UINT16, but we're not
+			 * guaranteed alignment is sane, so we can't just
+			 * typecast it directly.
+			 */
+			.len = (cur[i+3] << 8) | cur[i+2],
+		};
+
+		/*
+		 * We haven't found an EndEntire, so this has to be a valid
+		 * EFI_DEVICE_PATH in order for the data to be valid.  That
+		 * means it has to fit, and it can't be smaller than 4 bytes.
+		 */
+		if (dp.len < 4 || dp.len > limit)
+			return EFI_INVALID_PARAMETER;
+
+		/*
+		 * see if this is an EndEntire node...
+		 */
+		if (dp.type == 0x7f && dp.subtype == 0xff) {
+			/*
+			 * if we've found the EndEntire node, it must be 4
+			 * bytes
+			 */
+			if (dp.len != 4)
+				return EFI_INVALID_PARAMETER;
+
+			i += dp.len;
+			break;
+		}
+
+		/*
+		 * It's just some random DP node; skip it.
+		 */
+		i += dp.len;
+	}
+	if (i != fplistlen)
+		return EFI_INVALID_PARAMETER;
+
+	/*
+	 * if there's any space left, it's "optional data"
+	 */
+	*od = cur + i;
+	*ods = limit - i;
+	return EFI_SUCCESS;
+}
+
 /*
  * Check the load options to specify the second stage loader
  */
@@ -1958,11 +2345,11 @@ EFI_STATUS set_second_stage (EFI_HANDLE image_handle)
 {
 	EFI_STATUS status;
 	EFI_LOADED_IMAGE *li;
-	CHAR16 *start = NULL, *c;
-	unsigned int i;
+	CHAR16 *start = NULL;
 	int remaining_size = 0;
 	CHAR16 *loader_str = NULL;
-	unsigned int loader_len = 0;
+	UINTN loader_len = 0;
+	unsigned int i;
 
 	second_stage = DEFAULT_LOADER;
 	load_options = NULL;
@@ -1975,55 +2362,151 @@ EFI_STATUS set_second_stage (EFI_HANDLE image_handle)
 		return status;
 	}
 
-	/* Expect a CHAR16 string with at least one CHAR16 */
-	if (li->LoadOptionsSize < 4 || li->LoadOptionsSize % 2 != 0) {
+	/* So, load options are a giant pain in the ass.  If we're invoked
+	 * from the EFI shell, we get something like this:
+
+00000000  5c 00 45 00 36 00 49 00  5c 00 66 00 65 00 64 00  |\.E.F.I.\.f.e.d.|
+00000010  6f 00 72 00 61 00 5c 00  73 00 68 00 69 00 6d 00  |o.r.a.\.s.h.i.m.|
+00000020  78 00 36 00 34 00 2e 00  64 00 66 00 69 00 20 00  |x.6.4...e.f.i. .|
+00000030  5c 00 45 00 46 00 49 00  5c 00 66 00 65 00 64 00  |\.E.F.I.\.f.e.d.|
+00000040  6f 00 72 00 61 00 5c 00  66 00 77 00 75 00 70 00  |o.r.a.\.f.w.u.p.|
+00000050  64 00 61 00 74 00 65 00  2e 00 65 00 66 00 20 00  |d.a.t.e.e.f.i. .|
+00000060  00 00 66 00 73 00 30 00  3a 00 5c 00 00 00        |..f.s.0.:.\...|
+
+	*
+	* which is just some paths rammed together separated by a UCS-2 NUL.
+	* But if we're invoked from BDS, we get something more like:
+	*
+
+00000000  01 00 00 00 62 00 4c 00  69 00 6e 00 75 00 78 00  |....b.L.i.n.u.x.|
+00000010  20 00 46 00 69 00 72 00  6d 00 77 00 61 00 72 00  | .F.i.r.m.w.a.r.|
+00000020  65 00 20 00 55 00 70 00  64 00 61 00 74 00 65 00  |e. .U.p.d.a.t.e.|
+00000030  72 00 00 00 40 01 2a 00  01 00 00 00 00 08 00 00  |r.....*.........|
+00000040  00 00 00 00 00 40 06 00  00 00 00 00 1a 9e 55 bf  |.....@........U.|
+00000050  04 57 f2 4f b4 4a ed 26  4a 40 6a 94 02 02 04 04  |.W.O.:.&J@j.....|
+00000060  34 00 5c 00 45 00 46 00  49 00 5c 00 66 00 65 00  |4.\.E.F.I.f.e.d.|
+00000070  64 00 6f 00 72 00 61 00  5c 00 73 00 68 00 69 00  |o.r.a.\.s.h.i.m.|
+00000080  6d 00 78 00 36 00 34 00  2e 00 65 00 66 00 69 00  |x.6.4...e.f.i...|
+00000090  00 00 7f ff 40 00 20 00  5c 00 66 00 77 00 75 00  |...... .\.f.w.u.|
+000000a0  70 00 78 00 36 00 34 00  2e 00 65 00 66 00 69 00  |p.x.6.4...e.f.i.|
+000000b0  00 00                                             |..|
+
+	*
+	* which is clearly an EFI_LOAD_OPTION filled in halfway reasonably.
+	* In short, the UEFI shell is still a useless piece of junk.
+	*/
+
+	/*
+	 * In either case, we've got to have at least a UCS2 NUL...
+	 */
+	if (li->LoadOptionsSize < 2)
 		return EFI_BAD_BUFFER_SIZE;
-	}
-	c = (CHAR16 *)(li->LoadOptions + (li->LoadOptionsSize - 2));
-	if (*c != L'\0') {
-		return EFI_BAD_BUFFER_SIZE;
+
+	/*
+	 * Some awesome versions of BDS will add entries for Linux.  On top
+	 * of that, some versions of BDS will "tag" any Boot#### entries they
+	 * create by putting a GUID at the very end of the optional data in
+	 * the EFI_LOAD_OPTIONS, thus screwing things up for everybody who
+	 * tries to actually *use* the optional data for anything.  Why they
+	 * did this instead of adding a flag to the spec to /say/ it's
+	 * created by BDS, I do not know.  For shame.
+	 *
+	 * Anyway, just nerf that out from the start.  It's always just
+	 * garbage at the end.
+	 */
+	if (li->LoadOptionsSize > 16) {
+		if (CompareGuid((EFI_GUID *)(li->LoadOptions
+					     + (li->LoadOptionsSize - 16)),
+				&bds_guid) == 0)
+			li->LoadOptionsSize -= 16;
 	}
 
 	/*
-	 * UEFI shell copies the whole line of the command into LoadOptions.
-	 * We ignore the string before the first L' ', i.e. the name of this
-	 * program.
+	 * Check and see if this is just a list of strings.  If it's an
+	 * EFI_LOAD_OPTION, it'll be 0, since we know EndEntire device path
+	 * won't pass muster as UCS2-LE.
+	 *
+	 * If there are 3 strings, we're launched from the shell most likely,
+	 * But we actually only care about the second one.
 	 */
-	for (i = 0; i < li->LoadOptionsSize; i += 2) {
-		c = (CHAR16 *)(li->LoadOptions + i);
-		if (*c == L' ') {
-			*c = L'\0';
-			start = c + 1;
-			remaining_size = li->LoadOptionsSize - i - 2;
-			break;
+	UINTN strings = count_ucs2_strings(li->LoadOptions,
+					   li->LoadOptionsSize);
+	/*
+	 * If it's not string data, try it as an EFI_LOAD_OPTION.
+	 */
+	if (strings == 0) {
+		/*
+		 * We at least didn't find /enough/ strings.  See if it works
+		 * as an EFI_LOAD_OPTION.
+		 */
+		status = get_load_option_optional_data(li->LoadOptions,
+						       li->LoadOptionsSize,
+						       (UINT8 **)&start,
+						       &loader_len);
+		if (status != EFI_SUCCESS)
+			return EFI_SUCCESS;
+
+		remaining_size = 0;
+	} else if (strings >= 2) {
+		/*
+		 * UEFI shell copies the whole line of the command into
+		 * LoadOptions.  We ignore the string before the first L' ',
+		 * i.e. the name of this program.
+		 * Counting by two bytes is safe, because we know the size is
+		 * compatible with a UCS2-LE string.
+		 */
+		UINT8 *cur = li->LoadOptions;
+		for (i = 0; i < li->LoadOptionsSize - 2; i += 2) {
+			CHAR16 c = (cur[i+1] << 8) | cur[i];
+			if (c == L' ') {
+				start = (CHAR16 *)&cur[i+2];
+				remaining_size = li->LoadOptionsSize - i - 2;
+				break;
+			}
 		}
+
+		if (!start || remaining_size <= 0 || start[0] == L'\0')
+			return EFI_SUCCESS;
+
+		for (i = 0; start[i] != '\0'; i++) {
+			if (start[i] == L' ')
+				start[i] = L'\0';
+			if (start[i] == L'\0') {
+				loader_len = 2 * i + 2;
+				break;
+			}
+		}
+		if (loader_len)
+			remaining_size -= loader_len;
 	}
 
-	if (!start || remaining_size <= 0)
+	/*
+	 * Just to be sure all that math is right...
+	 */
+	if (loader_len % 2 != 0)
+		return EFI_INVALID_PARAMETER;
+
+	strings = count_ucs2_strings((UINT8 *)start, loader_len);
+	if (strings < 1)
 		return EFI_SUCCESS;
 
-	for (i = 0; start[i] != '\0'; i++) {
-		if (start[i] == L' ' || start[i] == L'\0')
-			break;
-		loader_len++;
-	}
-
 	/*
-	 * Setup the name of the alternative loader and the LoadOptions for
+	 * Set up the name of the alternative loader and the LoadOptions for
 	 * the loader
 	 */
 	if (loader_len > 0) {
-		loader_str = AllocatePool((loader_len + 1) * sizeof(CHAR16));
+		loader_str = AllocatePool(loader_len);
 		if (!loader_str) {
 			perror(L"Failed to allocate loader string\n");
 			return EFI_OUT_OF_RESOURCES;
 		}
-		for (i = 0; i < loader_len; i++)
+
+		for (i = 0; i < loader_len / 2; i++)
 			loader_str[i] = start[i];
-		loader_str[loader_len] = L'\0';
+		loader_str[loader_len/2-1] = L'\0';
 
 		second_stage = loader_str;
-		load_options = start;
+		load_options = remaining_size ? start + loader_len : NULL;
 		load_options_size = remaining_size;
 	}
 
@@ -2059,6 +2542,7 @@ install_shim_protocols(void)
 	 * Install the security protocol hook
 	 */
 	security_policy_install(shim_verify);
+	security_policy_install(shim_hash);
 #endif
 
 	return EFI_SUCCESS;
@@ -2173,7 +2657,7 @@ debug_hook(void)
 	while (x++) {
 		/* Make this so it can't /totally/ DoS us. */
 #if defined(__x86_64__) || defined(__i386__) || defined(__i686__)
-		if (x > 4294967294)
+		if (x > 4294967294ULL)
 			break;
 		__asm__ __volatile__("pause");
 #elif defined(__aarch64__)
@@ -2223,6 +2707,19 @@ efi_main (EFI_HANDLE passed_image_handle, EFI_SYSTEM_TABLE *passed_systab)
 	debug_hook();
 
 	/*
+	 * Measure the MOK variables
+	 */
+	efi_status = measure_mok();
+	if (efi_status != EFI_SUCCESS && efi_status != EFI_NOT_FOUND) {
+		Print(L"Something has gone seriously wrong: %r\n", efi_status);
+		Print(L"Shim was unable to measure state into the TPM\n");
+		systab->BootServices->Stall(5000000);
+		systab->RuntimeServices->ResetSystem(EfiResetShutdown,
+						     EFI_SECURITY_VIOLATION,
+						     0, NULL);
+	}
+
+	/*
 	 * Check whether the user has configured the system to run in
 	 * insecure mode
 	 */
@@ -2232,10 +2729,10 @@ efi_main (EFI_HANDLE passed_image_handle, EFI_SYSTEM_TABLE *passed_systab)
 	if (EFI_ERROR(efi_status)) {
 		Print(L"Something has gone seriously wrong: %r\n", efi_status);
 		Print(L"shim cannot continue, sorry.\n");
-		systab->BootServices->Stall(5000000);
-		systab->RuntimeServices->ResetSystem(EfiResetShutdown,
-						     EFI_SECURITY_VIOLATION,
-						     0, NULL);
+		uefi_call_wrapper(BS->Stall, 1, 5000000);
+		uefi_call_wrapper(systab->RuntimeServices->ResetSystem, 4,
+				  EfiResetShutdown, EFI_SECURITY_VIOLATION,
+				  0, NULL);
 	}
 
 	/*
